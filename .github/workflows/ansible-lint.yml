@@ -43,4 +43,4 @@ jobs:
 
       - name: Lint Ansible playbooks and roles
         run: |
-          uv run ansible-lint maintenance.yml roles/
+          uv run ansible-lint playbooks/
