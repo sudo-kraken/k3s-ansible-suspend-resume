@@ -1,0 +1,199 @@
+---
+# K3s cluster safe shutdown and startup
+# Tasks are guarded by tags: shutdown or startup
+# You must pass -e confirm=true to proceed
+
+- name: Pre-flight checks on control machine
+  hosts: localhost
+  gather_facts: false
+  vars:
+    must_confirm: "{{ (confirm | default(false)) | bool }}"
+  tasks:
+    - name: Require explicit confirmation
+      ansible.builtin.fail:
+        msg: "Set -e confirm=true to perform this operation."
+      when: not must_confirm
+      tags: [shutdown, startup]
+
+    - name: Check kubeconfig exists
+      ansible.builtin.stat:
+        path: "{{ kubeconfig | expanduser }}"
+      register: kubeconfig_stat
+      tags: [shutdown, startup]
+
+    - name: Fail if kubeconfig is missing
+      ansible.builtin.fail:
+        msg: "kubeconfig not found at {{ kubeconfig | expanduser }}. Set variable 'kubeconfig' to a valid path."
+      when: not kubeconfig_stat.stat.exists
+      tags: [shutdown, startup]
+
+    - name: Get Kubernetes nodes (sanity check)
+      kubernetes.core.k8s_info:
+        kind: Node
+      environment:
+        K8S_AUTH_KUBECONFIG: "{{ kubeconfig | expanduser }}"
+      register: nodes_info
+      tags: [shutdown, startup]
+
+    - name: Show nodes discovered
+      ansible.builtin.debug:
+        msg: "Discovered {{ nodes_info.resources | length }} node objects via Kubernetes API"
+      tags: [shutdown, startup]
+
+- name: Shutdown | drain and stop worker nodes
+  hosts: k3s_workers
+  gather_facts: true
+  become: true
+  any_errors_fatal: true
+  serial: 20
+  vars:
+    node_name_guess: "{{ ansible_hostname }}"
+  tasks:
+    - name: Kubernetes | cordon and drain worker
+      kubernetes.core.k8s_drain:
+        state: drain
+        name: "{{ node_name_guess }}"
+        delete_emptydir_data: false
+        ignore_daemonsets: true
+        disable_eviction: false
+        wait_timeout: "{{ drain_timeout }}"
+        pod_selectors: []
+      environment:
+        K8S_AUTH_KUBECONFIG: "{{ kubeconfig | expanduser }}"
+      delegate_to: localhost
+      tags: [shutdown]
+
+    - name: Stop k3s agent service
+      ansible.builtin.systemd:
+        name: "k3s-agent.service"
+        state: stopped
+        enabled: false
+      tags: [shutdown]
+
+- name: Shutdown | optional etcd snapshot on first master
+  hosts: k3s_masters[0]
+  gather_facts: true
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Create etcd snapshot (k3s embedded etcd)
+      ansible.builtin.command: "k3s etcd-snapshot save"
+      register: snapshot_result
+      changed_when: "'Saving' in snapshot_result.stdout or snapshot_result.rc == 0"
+      when: etcd_snapshot | bool
+      tags: [shutdown]
+
+    - name: Show snapshot result
+      ansible.builtin.debug:
+        var: snapshot_result.stdout
+      when: etcd_snapshot | bool
+      tags: [shutdown]
+
+- name: Shutdown | cordon and stop master nodes serially
+  hosts: k3s_masters
+  gather_facts: true
+  become: true
+  any_errors_fatal: true
+  serial: 1
+  tasks:
+    - name: Kubernetes | cordon master
+      kubernetes.core.k8s_drain:
+        state: cordon
+        name: "{{ ansible_hostname }}"
+      environment:
+        K8S_AUTH_KUBECONFIG: "{{ kubeconfig | expanduser }}"
+      delegate_to: localhost
+      tags: [shutdown]
+
+    - name: Pause to allow control plane to settle
+      ansible.builtin.pause:
+        seconds: "{{ shutdown_grace_period }}"
+      tags: [shutdown]
+
+    - name: Stop k3s server service
+      ansible.builtin.systemd:
+        name: "k3s.service"
+        state: stopped
+        enabled: false
+      tags: [shutdown]
+
+- name: Startup | start masters serially and wait for API
+  hosts: k3s_masters
+  gather_facts: true
+  become: true
+  any_errors_fatal: true
+  serial: 1
+  tasks:
+    - name: Start k3s server service
+      ansible.builtin.systemd:
+        name: "k3s.service"
+        state: started
+        enabled: true
+      tags: [startup]
+
+    - name: On first master, wait for API to become ready via nodes list
+      when: inventory_hostname == groups['k3s_masters'][0]
+      kubernetes.core.k8s_info:
+        kind: Node
+      register: api_check
+      retries: 30
+      delay: 5
+      until: api_check is succeeded
+      environment:
+        K8S_AUTH_KUBECONFIG: "{{ kubeconfig | expanduser }}"
+      delegate_to: localhost
+      tags: [startup]
+
+    - name: Pause briefly between master starts
+      ansible.builtin.pause:
+        seconds: "{{ shutdown_grace_period }}"
+      tags: [startup]
+
+- name: Startup | start workers
+  hosts: k3s_workers
+  gather_facts: true
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Start k3s agent service
+      ansible.builtin.systemd:
+        name: "k3s-agent.service"
+        state: started
+        enabled: true
+      tags: [startup]
+
+- name: Startup | uncordon all nodes
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Get node names
+      kubernetes.core.k8s_info:
+        kind: Node
+      register: nodes_after
+      environment:
+        K8S_AUTH_KUBECONFIG: "{{ kubeconfig | expanduser }}"
+      tags: [startup]
+
+    - name: Uncordon nodes
+      kubernetes.core.k8s_drain:
+        state: uncordon
+        name: "{{ item.metadata.name }}"
+      loop: "{{ nodes_after.resources | default([]) }}"
+      environment:
+        K8S_AUTH_KUBECONFIG: "{{ kubeconfig | expanduser }}"
+      tags: [startup]
+
+    - name: Show final node readiness summary
+      kubernetes.core.k8s_info:
+        kind: Node
+      register: final_nodes
+      environment:
+        K8S_AUTH_KUBECONFIG: "{{ kubeconfig | expanduser }}"
+      tags: [startup]
+
+    - name: Print summary
+      ansible.builtin.debug:
+        msg: >
+          K3s cluster startup complete.
+          Nodes discovered: {{ final_nodes.resources | length }}.
+      tags: [startup]

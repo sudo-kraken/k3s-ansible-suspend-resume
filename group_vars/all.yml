@@ -1,0 +1,13 @@
+---
+kubeconfig: "~/.kube/config"
+longhorn_namespace: "longhorn-system"
+critical_namespaces:
+  - "kube-system"
+  - "longhorn-system"
+  - "metallb-system"
+
+drain_timeout: 600
+shutdown_grace_period: 30
+etcd_snapshot: true
+etcd_snapshot_retention: 5
+confirm: false
